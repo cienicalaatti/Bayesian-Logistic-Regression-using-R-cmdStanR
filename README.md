@@ -1,1 +1,3 @@
-# Bayesian-Logistic-Regression-using-R-cmdStanR
+# Bayesian Logistic Regression-using R/cmdStanR
+
+Knitted Rmarkdowm .pdf under docs.

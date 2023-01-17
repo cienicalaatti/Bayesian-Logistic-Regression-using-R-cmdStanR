@@ -1,0 +1,673 @@
+---
+title: "Student performance prediction using bayesian logistic regression"
+output: 
+  pdf_document: 
+toc: TRUE
+urlcolor: blue
+bibliography: references.bib
+csl: ieee.csl
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+\clearpage
+
+## 1 Introduction
+
+Education is a key issue when we talk about a country's development. The
+learning process needs continuous effort from both students and
+teachers. Thus, student performance in a course is a matter that
+concerns teachers. For example, it is shown that even students with the
+same intelligence level and in the same school could have a clear
+difference in the result. It is also very clear that the performance of
+the students doesn't only rely on their understanding of the subject,
+and that it is affected by other factors. It might also be different for
+the same courses in different schools.
+
+In this project, we aim to predict how an individual student performs in
+the course while taking into consideration variables such as class
+participation, free time, father's and mother's education level, and
+school supplementary. This will be modeled using a Bayesian logistic
+regression. The order of the project is as follows: in section 2 the data is presented and discussed, and in section 3, we introduced the used models in the project and we defined suitable priors for scaled variables. In section 4, Stan codes for the two models are represented, while in section 5 and 6, the convergence of the models is discussed and posterior predictive check for the prediction problem is illustrated. In section 7, we compare the difference between the two models in context of the results, convergence and the reliability of estimates. In section 8, the prediction accuracy of the two models is shown. In section 9, we assessed the prior sensitivity for the two models. In the final part of the project, suggestions for improvement and discussion are presented.
+
+## 2 Data
+
+The data used in the project contains information on Portuguese
+secondary school students, collected during 2005 and 2006. The original
+dataset was collected and analysed in a 2008 study conducted by Paulo
+Cortez and Alice Silva, "Using data mining to predict secondary school
+student performance" [-@data]. In the study Cortez and Silva trained
+various machine learning models in order to predict student performance
+based on features such as study habits, family conditions and more.
+
+This project will utilize a subset of the original data, with a total of
+10 covariates and a single target variable. The first variable (school)
+will act as a grouping variable in the hierarchical model.
+
+| variable                  | type                                                              |
+|-----------------------|-------------------------------------------------|
+| school                    | binary: 1 - "Gabriel Pereira" or 2 - "Mousinho da Silveira"       |
+| sex                       | binary: "F" - female or "M" - male                                |
+| mother's education level  | numeric: 1 - 5                                                    |
+| father's education level  | numeric: 1 - 5                                                    |
+| travel time               | numeric: 1 - 5                                                    |
+| study time                | numeric: 1 - 5                                                    |
+| failures                  | numeric: 1 - 3 if class failures between this, 4 for 4 or greater |
+| extra educational support | binary: "yes" or "no"                                             |
+| health state              | numeric: 1 - 5                                                    |
+| number of absences        | numeric: 0 - 93                                                   |
+| final math grade          | numeric: 0 - 20                                                   |
+
+In this project, Bayesian logistic regression models will be used to
+predict whether the final math grade will be below or above 10.
+
+#### Data preprocessing
+
+```{r, message=FALSE}
+#import needed libraries
+library(cmdstanr)
+library(posterior)
+library(loo)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(bayesplot)
+#set_cmdstan_path('/coursedata/cmdstan')
+options(mc.cores=4)
+#set.seed(1234)
+```
+
+Reading the original dataset:
+
+```{r}
+student <- read.csv('student-mat.csv',sep = ';')
+```
+
+Mapping the grouping variable (school) to 1's and 2's, and the binary
+categorical variables and the target variable to 0's and 1's:
+
+```{r}
+student$school <- with(student, case_when(school == 'GP' ~ 1,
+                                            TRUE ~ 2))
+student$sex <- with(student, case_when(sex == 'F' ~ 0,
+                                            TRUE ~ 1))
+student$schoolsup <- with(student, case_when(schoolsup == 'yes' ~ 1,
+                                            TRUE ~ 0))
+student$G3 <- with(student, case_when(G3 < 10 ~ 0,
+                                            TRUE ~ 1))
+```
+
+Extracting the variables used in this analysis:
+
+```{r}
+index<-c(1,2,7,8,13,14,15,16,29,30,33)
+student_new<- student[,index]
+```
+
+Shuffling the data:
+
+```{r}
+student_new <- student_new[sample(nrow(student_new)),]
+```
+
+Scaling each variable (except for the grouping and the target variables)
+by substracting the variable mean $\mu_d$ and dividing by standard
+deviation $\sigma_d$:
+
+```{r}
+for (i in 2:10) {
+      student_new[i] <- scale(student_new[i])
+}
+```
+
+Dividing the data into training and testing:
+
+```{r}
+index<-1:20
+train_data<-student_new[-index,]
+test_data<-student_new[index,]
+```
+
+Data after preprocessing:
+
+```{r}
+head(train_data)
+```
+
+## 3 Description of the models
+
+### Bayesian logistic regression
+
+The likelihood function for a binary outcome variable for a single
+observation $y_i$ follows the binomial distribution
+
+$$p(y_i | \pi) = \pi(x_i)^{y_i} (1-\pi(x_i))^{1-y_i}$$
+
+where $\pi(x_i)$ is the probability of outcome $y_i$ with some predictor
+vector $x_i$. In the logistic regression model, this is written as
+
+$$\pi(x) = \frac{e^{\alpha + \beta_1x_1 + ... + \beta x_d}}{1+ e^{\alpha + \beta_1x_1 + ... + \beta x_d}},$$
+
+Where $\alpha$ (intercept) and $\beta_1, ... \beta_d$ are the unkown
+model parametes.
+
+Over the whole dataset with $N$ independent observations, the likelihood
+is
+
+$$\prod_{i=1}^N p(y_i | \pi(x_i)).$$
+
+Thus, the joint posterior distribution for all parameters $\beta$ is
+proportional to the product of the independent priors and the $N$
+likelihood contributions $p(y_i | \pi(x_i)$.
+
+In this project, two different bayesian logistic regression models are
+used and compared: 1. a pooled model, and 2. a hierarchical model.
+
+#### 1. Pooled model:
+
+In the pooled model, all of the data is treated as identically and
+independently distributed, and shared regression parameters $\alpha$
+$\beta$ are used. Each parameter gets a similar weakly informative prior
+
+$$\alpha \sim N(\mu, \sigma)$$ $$\beta_d \sim N(\mu, \sigma)$$
+
+with fixed mean and standard deviation $\mu = 0, \sigma = 10$.
+
+These weakly informative normal priors are suitable for the model
+because (prior to seeing the data), each parameter $\beta_d$ can be
+either positive or negative, and are unlikely to be far from zero -
+normal prior with zero mean accounts for this prior knowledge.
+
+#### 2. Hierarchical model:
+
+In the hierarchical model, the data is separated into $L$ groups, each
+of which get their own vector of parameters $\beta_l in \mathbb{R}^D$,
+where $D$ is the number of predictor variables in the data. Then for
+each group $l$, each individual parameter $\beta_{l,d}$ is given a prior
+$$\beta_{l,d} \sim N(\mu_d, \sigma_d)$$,
+
+where both $\mu_d$ and $\sigma_d$ are given hyper priors
+$$\mu_d \sim N(0, 10)$$ $$\sigma_d \sim Inv-\chi^2(10), \sigma_d > 0,$$
+
+which are common for all of the groups.
+
+The intercept $\alpha_l$ will be drawn for each group separately, with
+prior distribution $$\alpha_l \sim N(0,10).$$
+
+Similar to the pooled model, this selection of priors reasonably reflect
+the possible values of the true distribution while still allowing
+relatively large variation.
+
+## 4 Stan model implementation
+
+For all the Stan models, we used 1000 samples: half of these samples is for warm up and 4 chains.
+
+#### 1. Pooled model Stan implementation:
+
+```{r}
+pm <- cmdstan_model(stan_file = "project_pooled.stan")
+pm$print()
+```
+
+#### 2. Hierarchical model Stan implementation:
+
+```{r}
+hm <- cmdstan_model(stan_file = "project_hierarchical.stan")
+hm$print()
+```
+
+```{r}
+#fit and simulate the draws using the Stan models
+stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  y = train_data$G3,
+                  x_train = train_data[-c(1,11)],
+                  x_pred= test_data[-c(1,11)]
+)
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500)
+draws_pooled<- as_draws_df(pooled_model$draws())
+
+
+```
+```{r}
+stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  L = 2,
+                  y = train_data$G3,
+                  ll = train_data$school,
+                  x_train = train_data[-c(1,11)],
+                  x_pred = test_data[-c(1,11)],
+                  ll_pred = test_data$school
+)
+hierarchical_model <- hm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500)
+draws_hierarchical <- as_draws_df(hierarchical_model$draws())
+```
+
+## 5 Convergence diagnostics
+
+$\widehat{R}$ values:
+
+The potential scale reduction factor $\widehat{R}$, defined as the
+square root of the ratio between estimated marginal posterior variance
+of all chains and the intra-chain variance. If the MCMC chains converge
+as the number of iterations increase, the ratio
+$$\frac{\widehat{var^+(\psi|y)}}{W}$$ approaches 1. Thus, $\widehat{R}$
+estimates the factor by how much the scale of the current chain
+distribution $\psi$ could be reduced with more iterations. [-@r_hat]
+
+Effective sample sizes and the ESS / real sample size ratio:
+
+The effective sample size (ESS) is a measure by how much autocorrelation
+in MCMC samples increases uncertainty relative to an independent sample.
+
+Below is a visualization of the ratios ESS / N, where N is the number of
+MCMC samples. Generally, a ratio below $0.1$ indicates that the
+posterior predictions may not be reliable.
+
+CmdstanR also has an inbuilt function diagnose(), which in addition to the above metrics will analyze divergent transitions, transitions hitting maximum tree depth, and E-BFMI values.
+
+#### Pooled model:
+
+```{r, fig.align='center'}
+#rhat values for variables excluding ypred and log_lik
+color_scheme_set("purple")
+rhatp <- mcmc_rhat(pooled_model$summary()$rhat[1:11])
+
+N = 1000 # total MCMC sample size
+color_scheme_set("blue")
+neffp <- mcmc_neff(pooled_model$summary()$ess_bulk[1:10] / N)
+
+bayesplot_grid(rhatp, neffp, grid_args = list(nrow=2))
+
+pooled_model$cmdstan_diagnose()
+```
+All $\widehat{R}$ values are close to 1, and the effective sample sizes are large enough for all of the estimated parameters. In addition, the cdstan_diagnose() results for tree depth and E-BFMI indicates proper convergence with no divergent transitions.
+The chains seem to have converged without problems.
+
+#### Hierarchical model:
+
+```{r, fig.align='center'}
+#rhat values for variables excluding ypred and log_lik
+color_scheme_set("purple")
+rhath <-mcmc_rhat(pooled_model$summary()$rhat[1:42])
+
+N = 1000 # total MCMC sample size
+color_scheme_set("blue")
+neffh <-mcmc_neff(pooled_model$summary()$ess_bulk[1:42] / N)
+
+bayesplot_grid(rhath,neffh, grid_args = list(nrow=2))
+hierarchical_model$cmdstan_diagnose()
+```
+
+All $\widehat{R}$ values are close to 1, and the effective sample sizes are large enough for all of the estimated parameters. In addition, the cdstan_diagnose() results for tree depth and E-BFMI indicates proper convergence with no divergent transitions.
+The chains seem to have converged without problems.
+
+## 6 Posterior predictive checks
+
+The posterior predictive check for the models will be done by calculating the predicted proportion of students that pass the course, and compare that against the one of the observed data.
+
+Posterior predictive check (Pooled):
+
+```{r fig2, warning=FALSE, fig.height = 3}
+color_scheme_set("brightblue")
+ppc1 <-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_pooled[,387:761]), stat = mean)
+
+ppc2 <-ppc_bars(
+  y =train_data$G3,
+  yrep = as.matrix(draws_pooled[,387:761]),
+  freq=FALSE,
+  prob = 0.5,
+  fatten = 1,
+  size = 1.5
+)
+
+bayesplot_grid(ppc1,ppc2, grid_args = list(ncol=2), titles = c("mean proportion of 1's","proportions of 0 and 1"))
+mcmc_intervals(draws_pooled, pars = c("beta[1]", "beta[2]","beta[3]","beta[4]","beta[5]","beta[6]","beta[7]","beta[8]","beta[9]", "alpha")) + ggtitle("Posterior intervals of parameters")
+
+
+```
+
+Posterior predictive check (Hierarchical):
+
+```{r, warning=FALSE}
+color_scheme_set("pink")
+ppch1 <- ppc_stat(y = train_data$G3, yrep = as.matrix(draws_hierarchical[,415:789]), stat = mean)
+
+ppch2 <-ppc_bars_grouped(
+  y =train_data$G3,
+  yrep = as.matrix(draws_hierarchical[,415:789]),
+  group = train_data$school,
+  freq=FALSE,
+  prob = 0.9,
+  fatten = 1,
+  size = 1.5
+)
+
+ppch3 <- mcmc_intervals(draws_hierarchical, pars = c("beta[1,1]", "beta[1,2]","beta[1,3]","beta[1,4]","beta[1,5]","beta[1,6]","beta[1,7]","beta[1,8]","beta[1,9]", "alpha[1]"))
+
+ppch4 <- mcmc_intervals(draws_hierarchical, pars = c("beta[2,1]", "beta[2,2]","beta[2,3]","beta[2,4]","beta[2,5]","beta[2,6]","beta[2,7]","beta[2,8]","beta[2,9]", "alpha[2]"))
+
+bayesplot_grid(ppch1, ppch2, ppch3, ppch4 ,titles = c("mean proportion of 1's", "the proportions of 0's and 1's", "School 1 parameters", "School 2 parameters"))
+```
+
+True proportion of passing students in school 1 and 2, respectively:
+
+```{r}
+sum(student_new$G3[student_new$school==1])/sum(student_new$school==1)
+sum(student_new$G3[student_new$school==2])/sum(student_new$school==2)
+```
+
+
+For both of the models, the mean predicted value matches that of the data.
+
+The parameter interval plots describe the model parameter uncertainty related to their respective covariates: the wider the interval, the more uncertainty related to that parameter/covariate. It can be seen from the plots that the hierarchical model displays more uncertainty overall for students from the school 2, since the number of datapoints from the school is lower. The pooled model, on the other hand, shows combined and averaged uncertainty for the parameters as the group is not taken into account.
+
+The magnitude of the parameters also reflect the importance of their respective covariates: beta[6], for example, corresponds to the number of past failures of a student and is valued highly in both of the models, whereas the parameters for travel time or parent's education level have lower impact.
+
+## 7 Model Comparison
+
+Performing model comparison using PSIS-LOO cross validation:
+
+```{r}
+#values for the pooled model
+loo_p <- loo(pooled_model$draws("log_lik"), r_eff = relative_eff(pooled_model$draws("log_lik")))
+loo_p
+plot(loo_p)
+```
+
+```{r}
+loo_h <- loo(hierarchical_model$draws("log_lik"), r_eff = relative_eff(hierarchical_model$draws("log_lik")))
+loo_h
+plot(loo_h)
+```
+
+```{r}
+loo_compare(list("pooled"=loo_p, "hierarchical"=loo_h))
+```
+
+As per above, the pareto k values are good for both of the models, and the ELPD-LOO estimates are accurate. The effective number of parameters is also reasonable for both of the models, indicating proper model behaviour.
+
+The calculated ELPD-LOO value is slightly higher for the pooled model than the hierarchical model, though the difference is withing the Monte Carlo standard error: the models perform roughly equally well.
+
+As also seen in posterior predictive check results, both of the models produce similar results. This is mostly due to how the hierarchical model is structured: the different sets of parameters for each group are estimated with the data, and similar groups are reflected as smaller differences between the group parameters. The key difference between the models is in the uncertainty between predictions for different groups: The predictions for the group with less datapoints will have more uncertainty in the hierarchical model, whereas the pooled model does not account for the group.
+
+## 8 Prediction performance
+
+#### 10-folds Cross Validation for pooled model:
+ 
+We did K-folds Cross Validation with K=10 to assess the accuracy of the pooled model.
+
+```{r, echo = T, message=FALSE, warning=FALSE, results = 'hide'}
+accuracy_pooled=0
+index<-1:39
+for (k in 1:10){
+  index<-((k-1)*39+1):(k*39)
+  train_data<-student_new[-index,]
+  test_data<-student_new[index,]
+  stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  y = train_data$G3,
+                  x_train = train_data[-c(1,11)],
+                  x_pred= test_data[-c(1,11)]
+)
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500)
+draws_pooled<- as_draws_df(pooled_model$draws())  
+
+accuracy_pooled[k]=mean(round(apply(draws_hierarchical[,752:790], 2, mean)) == test_data$G3)
+}
+accuracy_pooled
+```
+
+
+#### 10-folds Cross Validation for hierarchical model:
+
+We did K-folds Cross Validation with K=10 to assess the accuracy of the hierarchical model.
+```{r, echo=T, message=FALSE, warning=FALSE, results='hide'}
+accuracy_hierarchical =0
+index<-1:39
+for (k in 1:10){
+  index<-((k-1)*39+1):(k*39)
+  train_data<-student_new[-index,]
+  test_data<-student_new[index,]
+  stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  L = 2,
+                  y = train_data$G3,
+                  ll = train_data$school,
+                  x_train = train_data[-c(1,11)],
+                  x_pred = test_data[-c(1,11)],
+                  ll_pred = test_data$school
+)
+hierarchical_model <- hm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500)
+draws_hierarchical <- as_draws_df(hierarchical_model$draws())
+
+accuracy_hierarchical [k]=mean(round(apply(draws_hierarchical[,752:790], 2, mean)) == test_data$G3)
+}
+```
+```{r}
+accuracy_pooled
+mean(accuracy_pooled)
+accuracy_hierarchical 
+mean(accuracy_hierarchical)
+sd(accuracy_pooled)
+sd(accuracy_hierarchical)
+```
+
+
+Despite seeing similar performance in the previous model performance estimates like ELPD-loo values and posterior predictive checks, it can be seen that the average value of the validation accuracy for the hierarchical model is better than the pooled one. The average accuracy for the hierarchical model is 71% and for the pooled is 61%.
+
+
+## 9 Sensitivity analysis with respect to prior choices
+
+Testing the model performance with different priors: The sensitivity is
+estimated by varying the prior distributions and their parameter
+selections, and calculating the posterior mean for the proportion of
+passing students against the true proportion in the data.
+
+#### 1. Pooled model:
+
+```{r, echo=FALSE}
+index<-1:20
+train_data<-student_new[-index,]
+test_data<-student_new[index,]
+
+stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  y = train_data$G3,
+                  x_train = train_data[-c(1,11)],
+                  x_pred= test_data[-c(1,11)]
+)
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+SEED = 48927
+
+pm <- cmdstan_model(stan_file = "project_pooled_prior1.stan")
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_pooled_prior1<- as_draws_df(pooled_model$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(pooled_model$draws("log_lik"), r_eff = relative_eff(pooled_model$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+pm <- cmdstan_model(stan_file = "project_pooled_prior2.stan")
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_pooled_prior2<- as_draws_df(pooled_model$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(pooled_model$draws("log_lik"), r_eff = relative_eff(pooled_model$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+pm <- cmdstan_model(stan_file = "project_pooled_prior3.stan")
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_pooled_prior3<- as_draws_df(pooled_model$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(pooled_model$draws("log_lik"), r_eff = relative_eff(pooled_model$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+
+pm <- cmdstan_model(stan_file = "project_pooled_prior4.stan")
+pooled_model <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_pooled_prior4<- as_draws_df(pooled_model$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(pooled_model$draws("log_lik"), r_eff = relative_eff(pooled_model$draws("log_lik")))
+loo_p
+```
+
+```{r, warning=FALSE, message=FALSE, fig.align='center'}
+p1<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_pooled_prior1[,387:761]), stat = mean)
+
+p2<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_pooled_prior2[,387:761]), stat = mean)
+
+p3<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_pooled_prior3[,387:761]), stat = mean)
+
+p4<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_pooled_prior4[,387:761]), stat = mean)
+
+bayesplot_grid(p1,p2,p3,p4, grid_args = list(nrow=2,ncol=2), titles = c("pm1", "pm2", "pm3", "pm4"))
+
+```
+
+| Model | $\alpha$ prior | $\beta$ prior | $\mu(T_{yrep})$ | $T_{yrep}$ 2.5% | $T_{yrep}$ 97.5% | divergent transitions | % -pareto k > 0.7 |
+|---------|---------|---------|---------|---------|---------|---------|---------|
+| pm1   | normal(0,1)    | normal(0,1)   | 0.67             | 0.61             | 0.73              | 0                     | 0                   |
+| pm2   | cauchy(0,10)   | cauchy(0,10)  | 0.67             | 0.61             | 0.73              | 0                     | 0                   |
+| pm3   | cauchy(0,1)    | cauchy(0,1)   | 0.67             | 0.61             | 0.73              | 0                     | 0                   |
+| pm4   | normal(0,1)    | cauchy(0,1    | 0.67             | 0.61             | 0.73              | 0                     | 0                   |
+
+With different priors, the posterior mean stays close to the observation
+mean. The pooled model is therefore rather robust, and the changes in
+the prior distributions have little effect on the posterior.
+
+#### Hierarchical model:
+
+```{r, echo = FALSE}
+stan_data <- list(
+                  D = ncol(student_new)-2,
+                  N_train = nrow(train_data),
+                  N_test = nrow(test_data),
+                  L = 2,
+                  y = train_data$G3,
+                  ll = train_data$school,
+                  x_train = train_data[-c(1,11)],
+                  x_pred = test_data[-c(1,11)],
+                  ll_pred = test_data$school
+)
+```
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+pm <- cmdstan_model(stan_file = "project_hierarchical_prior1.stan")
+hierarchical_model1 <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_hierarchical_prior1<- as_draws_df(hierarchical_model1$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+pm <- cmdstan_model(stan_file = "project_hierarchical_prior2.stan")
+hierarchical_model2 <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_hierarchical_prior2<- as_draws_df(hierarchical_model2$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+pm <- cmdstan_model(stan_file = "project_hierarchical_prior3.stan")
+hierarchical_model3 <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_hierarchical_prior3<- as_draws_df(hierarchical_model3$draws())
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+pm <- cmdstan_model(stan_file = "project_hierarchical_prior4.stan")
+hierarchical_model4 <- pm$sample(data = stan_data, refresh=0, show_messages = FALSE, chains = 4, iter_warmup = 500, iter_sampling = 500, seed = SEED)
+draws_hierarchical_prior4<- as_draws_df(hierarchical_model4$draws())
+```
+
+```{r,warning=FALSE, message=FALSE, fig.align='center'}
+
+
+p1<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_hierarchical_prior1[,415:789]), stat = mean)
+
+p2<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_hierarchical_prior2[,415:789]), stat = mean)
+
+p3<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_hierarchical_prior3[,415:789]), stat = mean)
+
+p4<-ppc_stat(y = train_data$G3, yrep = as.matrix(draws_hierarchical_prior4[,415:789]), stat = mean)
+
+bayesplot_grid(p1,p2,p3,p4, grid_args = list(nrow=2, ncol=2), titles = c("hm1", "hm2", "hm3", "hm4"))
+
+```
+![](prior_h.png)
+
+As seen in the graphs above, the posterior distribution of the point
+estimate varies noticeably between different prior choices. With more
+informative prior choices, especially for the intercept parameter
+$\alpha$, the posterior distribution is subject to change: the
+hierarchical model is thus more sensitive to different priors than the
+pooled model.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(hierarchical_model1$draws("log_lik"), r_eff = relative_eff(hierarchical_model1$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(hierarchical_model2$draws("log_lik"), r_eff = relative_eff(hierarchical_model2$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(hierarchical_model3$draws("log_lik"), r_eff = relative_eff(hierarchical_model3$draws("log_lik")))
+loo_p
+```
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+loo_p <- loo(hierarchical_model4$draws("log_lik"), r_eff = relative_eff(hierarchical_model4$draws("log_lik")))
+loo_p
+```
+
+## 10 Discussion of issues 
+
+
+The two models have good PSIS values, and both have good k-values, for the hierarchical one, one should think about the priors carefully as with priors having less variation around the mean, the divergence of chains is increasing. Despite this issue, it gives better accuracy for the prediction. Because the data has many variables, the model has many different parameters to estimate, which makes it more complicated to assess various model performance metrics.
+
+To improve the model, one can think about variable selection criteria since the data has 30 variables and we only used 10 covariates. In the current settings, the prediction accuracy is good, but it might increase with another chosen set of variables. 
+
+## 11 Conclusion
+
+In conclusion, the models have performed fairly in the context of convergence diagnostics, and posterior predictive checks. When predicting the unseen data, the hierarchical model has much better performance.
+
+It has shown that the chosen set of variables are able to achieve fair accuracy which means that the performance of a student is not only depending on the student but rather to this set of variables such as parental education, number of failures, number of absences,..  They are really playing a crucial role in the performance of the students as they can have positive or negative influences on the performance. 
+
+In the hierarchical model, the uncertainty for the second school increases because it has low proportion of the data whereas in the pooled model where data is combined, the uncertainty is also combined.  
+
+## 12 Self reflection
+
+The process of conducting and writing an extensive Bayesian data analysis report was both a demanding and rewarding task. While working on the project, the group had to reread and practically implement both the theory and analysis workflow taught during the course, in such a way which knit the individual topics into a coherent whole.
+
+While the project taught many of the topics well and deepened our understanding of them, working on it would have been a lot more streamlined and structured had the course contents been studied more thoroughly before: this caused us to go through iterations that could have been skipped with better understanding of the subject.
+
+As an example of the practical Bayesian data analysis, we learnt that not any data can be used for hierarchical models. The data must have levels from the beginning, one cannot use a covariate in the data to associate it with outcome and make it as levels for the hierarchical model. Moreover, we learnt a lot about plotting new things such as ppc, and mcmc_intervals, how to use hierarchical logistic regression and pooled one. How to do a posterior predictive check for a prediction problem. While doing the sensitivity analysis, we learnt how the prior has effect on the results and on the divergence.
+\clearpage
